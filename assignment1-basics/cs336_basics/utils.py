@@ -93,8 +93,8 @@ def get_batch(
     input_batch_indices = batch_smaple_start_indices[:, None] + context_indices[None, :]
 
     # Smaple data from dataset and create the Tensor.
-    input_batch_data = torch.tensor(dataset[input_batch_indices], device=device, dtype=torch.long)
-    target_batch_data = torch.tensor(dataset[input_batch_indices + 1], device=device, dtype=torch.long)
+    input_batch_data = torch.as_tensor(dataset[input_batch_indices].astype(np.int64, copy=False), device=device)
+    target_batch_data = torch.as_tensor(dataset[input_batch_indices + 1].astype(np.int64, copy=False), device=device)
 
     return input_batch_data, target_batch_data
 

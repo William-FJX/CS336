@@ -6,9 +6,12 @@ import torch.nn as nn
 import argparse
 import logging
 import sys
+from pathlib import Path
 import wandb
 
 from torch.utils.tensorboard.writer import SummaryWriter
+from cs336_basics.graph import build_shared_pretext_graph, build_shared_context_graph
+from cs336_basics.graph_loss import GraphTripletLoss
 from cs336_basics.tokenizer import Tokenizer
 from cs336_basics.module import *
 from cs336_basics.optimizer import AdamW
@@ -16,6 +19,22 @@ from cs336_basics.utils import *
 
 torch.backends.cudnn.enabled = True
 os.environ["ROCM_PATH"] = "/dev/null"
+
+def build_graph_loss(train_data, graph):
+    if graph is None or graph.loss_weight == 0:
+        return None
+    if graph.loss_weight < 0:
+        raise ValueError("graph.loss_weight must be nonnegative.")
+    builders = {"pretext": build_shared_pretext_graph, "context": build_shared_context_graph}
+    if graph.type not in builders:
+        raise ValueError("graph.type must be 'pretext' or 'context'.")
+    edge_counts = builders[graph.type](
+        train_data[:graph.token_limit],
+        context_length=graph.context_length,
+        max_successors=graph.max_successors,
+    )
+    return GraphTripletLoss(edge_counts, margin_scale=graph.margin_scale)
+
 
 class Config(dict):
     def __init__(self, *args, **kwargs):
@@ -30,6 +49,32 @@ def load_config(config_path: str | os.PathLike) -> dict:
     with open(config_path, 'r', encoding='utf8') as f:
         config = yaml.safe_load(f)
     return config
+
+
+def load_token_prefix(path, limit, context_length):
+    """Return the training/evaluation prefix and the total number of tokens on disk."""
+    path = Path(path)
+    if limit is not None and (type(limit) is not int or limit < 1):
+        raise ValueError(f"{path}: token limit must be a positive integer or null.")
+    if path.suffix == ".bin":
+        # The TinyStories preparation script writes one little-endian uint16 per token.
+        total, remainder = divmod(path.stat().st_size, 2)
+        if remainder:
+            raise ValueError(f"{path}: incomplete uint16 token.")
+        count = total if limit is None else min(limit, total)
+        if count > context_length:
+            return np.memmap(path, dtype="<u2", mode="r", shape=(count,)), total
+    elif path.suffix == ".npz":
+        # Existing experiment configs use compressed NumPy archives.
+        with np.load(path) as archive:
+            tokens = archive["arr_0"]
+        total = len(tokens)
+        prefix = tokens[:limit]
+        if len(prefix) > context_length:
+            return prefix.astype(np.int32, copy=False), total
+    else:
+        raise ValueError(f"{path}: expected a uint16 .bin file or an .npz archive.")
+    raise ValueError(f"{path}: at least {context_length + 1} tokens are needed for a next-token batch.")
 
 
 def get_logger(log_path: str) -> logging.Logger:
@@ -106,7 +151,8 @@ def build_optimizer(model: nn.Module, config: dict) -> torch.optim.Optimizer:
         params=model.parameters(),
         lr=config.optimizer.min_lr,
         weight_decay=config.optimizer.weight_decay,
-        betas=config.optimizer.betas)
+        betas=config.optimizer.betas,
+        eps=config.optimizer.get('eps', 1e-8))
     return optimizer
 
 
@@ -181,10 +227,10 @@ def val_model_all(model: nn.Module, val_data: np.array, config: dict, device: st
     model.train()
     return sum(losses)/len(losses)
 
-def train(config_path: str):
+def train(config_path: str, output_dir=None):
     # Log setting.
     exp_name = os.path.basename(config_path).split('.')[0]
-    save_root = os.path.join('exp_output', exp_name)
+    save_root = output_dir or os.path.join('exp_output', exp_name)
     os.makedirs(save_root, exist_ok=True)
     log_path = os.path.join(save_root, 'log.txt')
     logger = get_logger(log_path)
@@ -192,6 +238,9 @@ def train(config_path: str):
 
     # Load config file.
     config = Config(load_config(config_path=config_path))
+    if config.get('seed') is not None:
+        torch.manual_seed(config.seed)
+        np.random.seed(config.seed)
     logger.info(f'Loaded configuration from {config_path}')
     # set_wandb(config)
     writer = get_tensorboard(save_root)
@@ -204,7 +253,8 @@ def train(config_path: str):
     model = build_model(config=config)
     model.to(device=device)
     model.train()
-    model = get_compile(model, device)
+    if config.get('compile', True):
+        model = get_compile(model, device)
 
     # Build optimizer based on the config.
     optimizer = build_optimizer(model=model, config=config)
@@ -213,13 +263,23 @@ def train(config_path: str):
     start_iteration = 1
     if config.trainer.get('resume', False) is True:
         logger.info(f"Loading checkpoint from {config.trainer.load_ckpt_path}")
-        start_iteration = load_checkpoint(config.trainer.load_ckpt_path, model, optimizer)
-        logger.info(f"Resumed trainer from iteration {start_iteration}")
+        last_iteration = load_checkpoint(config.trainer.load_ckpt_path, model, optimizer)
+        start_iteration = last_iteration + 1
+        if start_iteration > config.trainer.max_iteration:
+            raise ValueError("Set max_iteration above the checkpoint's completed update count.")
+        logger.info(f"Resuming training at iteration {start_iteration}")
     # model = torch.compile(model, backend='aot_eager')
 
-    # Load dataset from the .npz/.npy file.
-    train_data = np.load(config.data.train_path, mmap_mode='r')['arr_0'].astype(np.int32)
-    valid_data = np.load(config.data.val_path, mmap_mode='r')['arr_0'].astype(np.int32)
+    train_data, train_total = load_token_prefix(
+        config.data.train_path, config.data.get("train_token_limit"), config.model.context_length
+    )
+    valid_data, val_total = load_token_prefix(
+        config.data.val_path, config.data.get("val_token_limit"), config.model.context_length
+    )
+    logger.info(f"Training pool: {len(train_data):,} of {train_total:,} tokens")
+    logger.info(f"Validation pool: {len(valid_data):,} of {val_total:,} tokens")
+    graph = config.get('graph')
+    graph_loss_fn = build_graph_loss(train_data, graph)
 
     # Start training.
     for it in range(start_iteration, config.trainer.max_iteration + 1):
@@ -235,7 +295,13 @@ def train(config_path: str):
         predict_batch_data = model(input_batch_data)
 
         # Calculate the loss and backward.
-        loss = cross_entropy_loss(inputs=predict_batch_data, targets=target_batch_data)
+        lm_loss = cross_entropy_loss(inputs=predict_batch_data, targets=target_batch_data)
+        loss = lm_loss
+        if graph_loss_fn is not None:
+            graph_loss = graph_loss_fn(
+                model.token_embeddings.weight, batch_size=graph.batch_size, num_negatives=graph.num_negatives
+            )
+            loss = lm_loss + graph.loss_weight * graph_loss
         optimizer.zero_grad()
         loss.backward()
         
@@ -261,16 +327,19 @@ def train(config_path: str):
 
         # --------------------------------------------------------------------------------
         # Log the message.
-        if it % config.trainer.print_frequency == 0 and it > 0:
-            logger.info(f"Iteration: {it}, train loss: {loss.detach().cpu().item()}, norm: {l2_norm}")
+        if it % config.trainer.print_frequency == 0 or it == config.trainer.max_iteration:
+            logger.info(f"Iteration: {it}, train loss: {lm_loss.item()}, norm: {l2_norm}")
             # wandb.log({'train_loss': loss.detach().cpu().item()}, step=it)
-            writer.add_scalar('train loss', loss.detach().cpu().item(), it)
+            writer.add_scalar('train loss', lm_loss.item(), it)
+            if graph_loss_fn is not None:
+                writer.add_scalar('graph loss', graph_loss.item(), it)
+                writer.add_scalar('total loss', loss.item(), it)
             writer.add_scalar('lr', lr, it)
             writer.add_scalar('l2norm', l2_norm, it)
 
         
         # Evaluation.
-        if it % config.trainer.val_frequency == 0 and it > 0:
+        if it % config.trainer.val_frequency == 0 or it == config.trainer.max_iteration:
             val_loss = val_model(model, valid_data, config, device)
             logger.info(f"Iteration: {it}, val loss: {val_loss}")
             # wandb.log({'val_loss': val_loss}, step=it)
@@ -284,11 +353,12 @@ def train(config_path: str):
             save_checkpoint(model, optimizer, it, checkpoint_path)
             logger.info(f"Saved checkpoint iteration {it} to {checkpoint_path}")
     
-    # wandb.finish()
+    writer.close()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('cs336: llm-from-zero')
     parser.add_argument('--config', type=str, default='config.yaml', help='the model and trainer config file path')
+    parser.add_argument('--output-dir', help='directory for this run’s logs and checkpoints')
     args = parser.parse_args()
 
-    train(args.config)
+    train(args.config, output_dir=args.output_dir)

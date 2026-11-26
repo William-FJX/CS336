@@ -1,0 +1,60 @@
+plot_loss: validation  # validation or training; both are next-token cross-entropy
+defaults:
+  seed: 0
+  device: cpu           # cpu, cuda (Colab GPU), or mps (Apple Silicon)
+  compile: false
+  ablation: null        # null = standard Transformer; postnorm, norms, nope, or silu
+  data:                 # Full TinyStories with the repo's BPE. Each limit selects a prefix; null = whole split.
+    # On a fresh checkout, place both original .txt splits in data/full/, then run:
+    # uv run --python 3.11 python script/prepare_tinystories.py
+    train_path: data/full/TinyStoriesV2-GPT4-train.bin
+    val_path: data/full/TinyStoriesV2-GPT4-valid.bin
+    train_token_limit: 500000000  # First 500M of 541,232,358 training tokens.
+    val_token_limit: 5000000     # First 5M of 5,465,918 validation tokens.
+  model:
+    vocab_size: 10000   # Must cover all IDs in both data files.
+    context_length: 32
+    d_model: 64
+    num_layers: 2
+    num_heads: 4
+    d_ff: 192
+    rope_theta: 100000
+  optimizer:            # AdamW with warmup and cosine decay
+    max_lr: 0.01
+    min_lr: 0.0001
+    warmup_iters: 5
+    cosine_cycle_iters: 500
+    betas: [0.9, 0.95]
+    eps: 1.0e-8
+    max_l2_norm: 1.0
+    weight_decay: 0.01
+  trainer:
+    max_iteration: 500  # Each update predicts batch_size x model.context_length tokens.
+    batch_size: 8
+    print_frequency: 5  # Record training loss every N updates.
+    val_frequency: 5    # Record validation loss every N updates.
+    save_frequency: 0   # 0 disables checkpoints.
+    resume: false
+    load_ckpt_path: null
+  graph:
+    loss_weight: 0.0    # 0 = baseline; skip graph construction and sampling.
+    type: pretext       # pretext = left context; context = both sides
+    context_length: 1   # Tokens on each side used by the chosen rule
+    token_limit: 5000000   # First n training IDs for graph construction.
+    max_successors: 10000 # Skip contexts with more distinct targets; null = no cap
+    batch_size: 64      # Anchors sampled per optimizer update
+    num_negatives: 8    # Per anchor; positive = strongest edge, ties sampled uniformly
+    margin_scale: 10.0  # log(1 + (ratio gap / margin_scale)^2)
+
+# Each name is a legend label. Copy a block and give it a new name to add a curve.
+experiments:
+  baseline: {}
+  left-two, 0.01:
+    graph: {type: pretext, context_length: 2, loss_weight: 0.01}
+  one-each-side, 0.01:
+    graph: {type: context, context_length: 1, loss_weight: 0.01}
+  left-two, 1:
+    graph: {type: pretext, context_length: 2, loss_weight: 1}
+  left-two, 10:
+    graph: {type: pretext, context_length: 2, loss_weight: 10}
+  

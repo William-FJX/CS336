@@ -13,7 +13,14 @@
 </p>
 
 
-## Preamble
+## Token graph and auxiliary loss
+
+This project builds on zhasion’s implementation of Stanford’s CS336 assignments. My additions use TinyStories to study how shared context can shape token embeddings. [Upstream implementation](https://github.com/zhasion/CS336) · [Stanford assignment](https://github.com/stanford-cs336/assignment1-basics)
+
+- **Token graph.** Two tokens share an edge when they appear after the same sequence of tokens, or when they share the same context on both sides. Each distinct context they share adds one to the edge weight. [Graph construction](assignment1-basics/cs336_basics/graph.py)
+- **Auxiliary triplet loss.** For each sampled token, the loss encourages its embedding to have higher cosine similarity to its strongest graph neighbor than to randomly sampled tokens. The required margin grows with the difference in their edge weights. [Graph loss](assignment1-basics/cs336_basics/graph_loss.py)
+
+## Original preamble by zhasion
 
 This repository contains my personal implementations for the assignments of Stanford's CS336 course, along with answers to some related questions (note: the content is for reference only and may not be entirely accurate).
 
